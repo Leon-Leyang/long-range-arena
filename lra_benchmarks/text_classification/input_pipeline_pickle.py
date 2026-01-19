@@ -48,6 +48,10 @@ def extract_inputs_targets(data):
     elif 'input_ids' in data and 'label' in data:
       inputs = data['input_ids']
       targets = data['label']
+    elif 'input_ids_0' in data and 'label' in data:
+      # Kaggle format for single-sequence datasets
+      inputs = data['input_ids_0']
+      targets = data['label']
     else:
       raise ValueError(f"Unexpected dict keys: {list(data.keys())}")
   elif isinstance(data, (list, tuple)):
@@ -57,10 +61,23 @@ def extract_inputs_targets(data):
     
     first_item = data[0]
     if isinstance(first_item, dict):
-      # List of dictionaries
-      if 'input_ids' in first_item or 'inputs' in first_item:
-        input_key = 'input_ids' if 'input_ids' in first_item else 'inputs'
-        label_key = 'label' if 'label' in first_item else ('labels' if 'labels' in first_item else 'targets')
+      # List of dictionaries - try multiple key patterns
+      input_key = None
+      label_key = None
+      
+      # Find input key
+      for key in ['input_ids_0', 'input_ids', 'inputs', 'data', 'x']:
+        if key in first_item:
+          input_key = key
+          break
+      
+      # Find label key
+      for key in ['label', 'labels', 'targets', 'y']:
+        if key in first_item:
+          label_key = key
+          break
+      
+      if input_key and label_key:
         inputs = [item[input_key] for item in data]
         targets = [item[label_key] for item in data]
       else:
