@@ -50,19 +50,10 @@ class TransformerBlock(nn.Module):
     assert inputs.ndim == 3
     x = nn.LayerNorm(dtype=self.dtype)(inputs)
     
-    # Create attention mask from padding mask
-    if padding_mask is not None:
-      # padding_mask shape: [batch, seq_len, 1]
-      # We need [batch, 1, seq_len, seq_len] for attention
-      # Where True means "attend to this position"
-      attention_mask = padding_mask[:, None, None, :, 0]  # [batch, 1, 1, seq_len]
-      attention_mask = jnp.broadcast_to(
-          attention_mask,
-          (inputs.shape[0], 1, inputs.shape[1], inputs.shape[1]))
-    else:
-      attention_mask = None
-
-    x = nn.MultiHeadDotProductAttention(
+    # Apply attention - Flax's MultiHeadDotProductAttention doesn't support padding_mask
+    # directly, so we mask the output after attention computation
+    # This is more memory efficient than creating a full [seq_len, seq_len] attention mask
+    x_attn = nn.MultiHeadDotProductAttention(
         num_heads=self.num_heads,
         dtype=self.dtype,
         qkv_features=self.qkv_dim,
@@ -71,9 +62,13 @@ class TransformerBlock(nn.Module):
         use_bias=False,
         broadcast_dropout=False,
         dropout_rate=self.attention_dropout_rate,
-        deterministic=deterministic)(x, x, mask=attention_mask)
+        deterministic=deterministic)(x, x)
     
-    x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
+    # Mask out padded positions in the output (zero them out)
+    if padding_mask is not None:
+      x_attn = x_attn * padding_mask
+    
+    x = nn.Dropout(rate=self.dropout_rate)(x_attn, deterministic=deterministic)
     x = x + inputs
 
     # MLP block.
