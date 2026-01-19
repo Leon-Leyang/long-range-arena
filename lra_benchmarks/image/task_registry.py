@@ -14,7 +14,7 @@
 """Mapping tasks to data loaders."""
 
 import functools
-from lra_benchmarks.image import input_pipeline
+from lra_benchmarks.image import input_pipeline_pickle as input_pipeline
 
 TASK_DATA_DICT = {
     'cifar10':

@@ -31,7 +31,7 @@ import jax
 from jax import random
 import jax.nn
 import jax.numpy as jnp
-from lra_benchmarks.text_classification import input_pipeline
+from lra_benchmarks.text_classification import input_pipeline_pickle as input_pipeline
 from lra_benchmarks.utils import train_utils
 from ml_collections import config_flags
 import tensorflow.compat.v2 as tf
