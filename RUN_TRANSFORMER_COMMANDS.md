@@ -4,15 +4,21 @@ This document provides the commands to run Transformer models on each LRA task u
 
 ## Prerequisites
 
-1. Ensure pickle data files are in `./data/` directory (or specify `--data_dir`):
+1. Install updated dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. Ensure pickle data files are in `./data/` directory:
    - `lra-listops.{train,dev,test}.pickle`
    - `lra-text.{train,dev,test}.pickle`
    - `lra-retrieval.{train,dev,test}.pickle`
    - `lra-image.{train,dev,test}.pickle`
    - `lra-pathfinder32-curv_contour_length_14.{train,dev,test}.pickle`
 
-2. Set PYTHONPATH to include the long-range-arena directory:
+3. Set PYTHONPATH to include the long-range-arena directory:
    ```bash
+   cd /path/to/long-range-arena
    export PYTHONPATH="$(pwd):$PYTHONPATH"
    ```
 
@@ -93,13 +99,42 @@ PYTHONPATH="$(pwd):$PYTHONPATH" python lra_benchmarks/image/train.py \
     --task_name=pathfinder128_easy
 ```
 
+## Code Updates Summary
+
+The codebase has been updated to use modern JAX/Flax APIs:
+
+### Key Changes
+
+1. **Flax Linen API**: Replaced `flax.deprecated.nn` with `flax.linen`
+   - `nn.Module` with `apply()` → `nn.Module` with `@nn.compact` and `__call__()`
+   - `nn.Embed.partial()` → `nn.Embed` as a class attribute
+   - `nn.Dense(x, features)` → `nn.Dense(features)(x)`
+
+2. **Optax**: Replaced `flax.optim` with `optax`
+   - `optim.Adam()` → `optax.adamw()`
+   - `optimizer.apply_gradient()` → `state.apply_gradients()`
+
+3. **TrainState**: Using `flax.training.train_state.TrainState`
+   - No more `nn.Model` wrapper
+   - Cleaner state management
+
+4. **Checkpointing**: Using `orbax-checkpoint`
+   - `checkpoints.save_checkpoint()` → `ocp.StandardCheckpointer().save()`
+   - `checkpoints.restore_checkpoint()` → `ocp.StandardCheckpointer().restore()`
+
+5. **TensorBoard**: Using `tensorboardX.SummaryWriter`
+   - `flax.metrics.tensorboard` → `tensorboardX`
+
+6. **Dropout**: Passing dropout RNG through `rngs={'dropout': rng}`
+   - No more `nn.stochastic()` context manager
+
 ## Notes
 
 - All tasks now use pickle data automatically (modified to use `input_pipeline_pickle`)
 - The `--data_dir` should point to the directory containing pickle files
 - Default `--data_dir` is `./data` if not specified
 - Model checkpoints and logs will be saved to `--model_dir`
-- To run evaluation only, add `--test_only=True` flag
+- To run evaluation only, add `--test_only=True` flag (listops, text, matching) or `--eval_only=True` (image)
 
 ## Verification
 
@@ -131,6 +166,24 @@ You should see files like:
 If you get import errors, make sure:
 1. You're running from the `long-range-arena` directory
 2. PYTHONPATH includes the current directory
-3. All pickle files exist in the specified data directory
+3. All dependencies are installed: `pip install -r requirements.txt`
+4. All pickle files exist in the specified data directory
 
 If pickle files are not found, the scripts will raise a `FileNotFoundError` with the expected file path.
+
+### Common Issues
+
+1. **ModuleNotFoundError: No module named 'tensorboardX'**
+   ```bash
+   pip install tensorboardX
+   ```
+
+2. **ModuleNotFoundError: No module named 'optax'**
+   ```bash
+   pip install optax
+   ```
+
+3. **ModuleNotFoundError: No module named 'orbax'**
+   ```bash
+   pip install orbax-checkpoint
+   ```

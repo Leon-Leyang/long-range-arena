@@ -1,6 +1,13 @@
-jax>=0.2.4
-flax>=0.2.2
-ml-collections>=0.1.0
-tensorboard>=2.3.0
-tensorflow>=2.3.1
-tensorflow-datasets>=4.0.1
+# Updated requirements for modern JAX/Flax (2024+)
+jax>=0.4.20
+jaxlib>=0.4.20
+flax>=0.8.0
+optax>=0.1.7
+orbax-checkpoint>=0.4.0
+ml-collections>=0.1.1
+tensorboard>=2.15.0
+tensorboardX>=2.6.0
+tensorflow>=2.15.0
+tensorflow-datasets>=4.9.0
+numpy>=1.24.0
+absl-py>=2.0.0

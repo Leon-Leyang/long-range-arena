@@ -1,41 +1,44 @@
 # Copyright 2021 Google LLC
+# Updated for modern Flax (Linen) API and Optax
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Main training script for the listops task."""
+"""Main training script for the listops task - Updated for modern Flax/Optax."""
+
 import functools
 import itertools
 import json
 import os
 import time
+from typing import Any
 
 from absl import app
 from absl import flags
 from absl import logging
 from flax import jax_utils
-from flax import optim
-from flax.deprecated import nn
-from flax.metrics import tensorboard
-from flax.training import checkpoints
+from flax.training import train_state
 from flax.training import common_utils
+from flax.training import orbax_utils
+import orbax.checkpoint as ocp
 import jax
 from jax import random
-import jax.nn
 import jax.numpy as jnp
+import optax
 from lra_benchmarks.listops import input_pipeline_pickle as input_pipeline
 from lra_benchmarks.utils import train_utils
 from ml_collections import config_flags
 import numpy as np
-import tensorflow.compat.v2 as tf
+import tensorflow as tf
+from tensorboardX import SummaryWriter
 
 
 FLAGS = flags.FLAGS
@@ -54,30 +57,36 @@ flags.DEFINE_bool(
     'test_only', default=False, help='Run the evaluation on the test data.')
 
 
-def create_model(flax_module, model_kwargs, key, input_shape):
-  """Creates and initializes the model."""
-
-  @functools.partial(jax.jit, backend='cpu')
-  def _create_model(key):
-    module = flax_module.partial(**model_kwargs)
-    with nn.stochastic(key):
-      _, initial_params = module.init_by_shape(key,
-                                               [(input_shape, jnp.float32)])
-      model = nn.Model(module, initial_params)
-    return model
-
-  return _create_model(key)
+class TrainState(train_state.TrainState):
+  """Custom train state with dropout key."""
+  dropout_rng: Any = None
 
 
-def create_optimizer(model, learning_rate):
-  optimizer_def = optim.Adam(
-      learning_rate,
-      beta1=0.9,
-      beta2=0.98,
+def create_train_state(rng, model, learning_rate, weight_decay, input_shape):
+  """Creates initial TrainState."""
+  dropout_rng, params_rng = random.split(rng)
+  
+  # Initialize model
+  dummy_input = jnp.ones(input_shape, dtype=jnp.int32)
+  variables = model.init({'params': params_rng, 'dropout': dropout_rng}, 
+                         dummy_input, train=False)
+  params = variables['params']
+  
+  # Create optimizer with AdamW
+  tx = optax.adamw(
+      learning_rate=learning_rate,
+      b1=0.9,
+      b2=0.98,
       eps=1e-9,
-      weight_decay=FLAGS.config.weight_decay)
-  optimizer = optimizer_def.create(model)
-  return optimizer
+      weight_decay=weight_decay
+  )
+  
+  return TrainState.create(
+      apply_fn=model.apply,
+      params=params,
+      tx=tx,
+      dropout_rng=dropout_rng,
+  )
 
 
 def compute_metrics(logits, labels, weights):
@@ -94,55 +103,52 @@ def compute_metrics(logits, labels, weights):
   return metrics
 
 
-def train_step(optimizer, batch, learning_rate_fn, dropout_rng=None):
+def train_step(state, batch, learning_rate_fn):
   """Perform a single training step."""
-  train_keys = ['inputs', 'targets']
-  (inputs, targets) = [batch.get(k, None) for k in train_keys]
+  inputs = batch['inputs']
+  targets = batch['targets']
 
-  # We handle PRNG splitting inside the top pmap, rather
-  # than handling it outside in the training loop - doing the
-  # latter can add some stalls to the devices.
-  dropout_rng, new_dropout_rng = random.split(dropout_rng)
+  # Split dropout key
+  dropout_rng, new_dropout_rng = random.split(state.dropout_rng)
 
-  def loss_fn(model):
+  def loss_fn(params):
     """Loss function used for training."""
-    with nn.stochastic(dropout_rng):
-      logits = model(inputs, train=True)
+    logits = state.apply_fn(
+        {'params': params}, 
+        inputs, 
+        train=True,
+        rngs={'dropout': dropout_rng})
     loss, weight_sum = train_utils.compute_weighted_cross_entropy(
         logits, targets, num_classes=10, weights=None)
     mean_loss = loss / weight_sum
     return mean_loss, logits
 
-  step = optimizer.state.step
+  step = state.step
   lr = learning_rate_fn(step)
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-  (_, logits), grad = grad_fn(optimizer.target)
-  grad = jax.lax.pmean(grad, 'batch')
-  new_optimizer = optimizer.apply_gradient(grad, learning_rate=lr)
+  (_, logits), grads = grad_fn(state.params)
+  grads = jax.lax.pmean(grads, 'batch')
+  
+  state = state.apply_gradients(grads=grads)
+  state = state.replace(dropout_rng=new_dropout_rng)
+  
   metrics = compute_metrics(logits, targets, None)
   metrics['learning_rate'] = lr
 
-  return new_optimizer, metrics, new_dropout_rng
+  return state, metrics
 
 
-def eval_step(model, batch):
-  eval_keys = ['inputs', 'targets']
-  (inputs, targets) = [batch.get(k, None) for k in eval_keys]
-  logits = model(inputs, train=False)
+def eval_step(state, batch):
+  """Evaluation step."""
+  inputs = batch['inputs']
+  targets = batch['targets']
+  logits = state.apply_fn({'params': state.params}, inputs, train=False)
   return compute_metrics(logits, targets, None)
-
-
-def tohost(x):
-  """Collect batches from all devices to host and flatten batch dimensions."""
-  n_device, n_batch, *remaining_dims = x.shape
-  return np.array(x).reshape((n_device * n_batch,) + tuple(remaining_dims))
 
 
 def main(argv):
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
-
-  tf.enable_v2_behavior()
 
   config = FLAGS.config
   logging.info('===========Config Dict============')
@@ -158,8 +164,7 @@ def main(argv):
       config.model_kwargs.to_dict() if 'model_kwargs' in config else {})
 
   if jax.process_index() == 0:
-    summary_writer = tensorboard.SummaryWriter(
-        os.path.join(FLAGS.model_dir, 'summary'))
+    summary_writer = SummaryWriter(os.path.join(FLAGS.model_dir, 'summary'))
 
   if batch_size % jax.device_count() > 0:
     raise ValueError('Batch size must be divisible by the number of devices')
@@ -194,24 +199,36 @@ def main(argv):
   rng = random.PRNGKey(random_seed)
   rng = jax.random.fold_in(rng, jax.process_index())
   rng, init_rng = random.split(rng)
-  # We init the first set of dropout PRNG keys, but update it afterwards inside
-  # the main pmap'd training update for performance.
-  dropout_rngs = random.split(rng, jax.local_device_count())
 
-  model = train_utils.get_model(model_type, create_model, model_kwargs,
-                                init_rng, input_shape)
-
-  optimizer = create_optimizer(model, learning_rate)
-  del model  # Don't keep a copy of the initial model.
+  # Create model
+  model_class = train_utils.get_model_class(model_type)
+  model = model_class(**model_kwargs)
+  
+  # Create train state
+  state = create_train_state(
+      init_rng, model, learning_rate, 
+      config.weight_decay, input_shape)
+  
   start_step = 0
+  
+  # Checkpoint management
+  ckpt_dir = os.path.join(FLAGS.model_dir, 'checkpoints')
+  os.makedirs(ckpt_dir, exist_ok=True)
+  
   if config.restore_checkpoints or FLAGS.test_only:
-    # Restore unreplicated optimizer + model state from last checkpoint.
-    optimizer = checkpoints.restore_checkpoint(FLAGS.model_dir, optimizer)
-    # Grab last step.
-    start_step = int(optimizer.state.step)
+    # Try to restore from checkpoint
+    checkpointer = ocp.StandardCheckpointer()
+    if os.path.exists(ckpt_dir) and os.listdir(ckpt_dir):
+      latest_step = max([int(d.split('_')[-1]) for d in os.listdir(ckpt_dir) 
+                        if d.startswith('checkpoint_')])
+      ckpt_path = os.path.join(ckpt_dir, f'checkpoint_{latest_step}')
+      restored = checkpointer.restore(ckpt_path, state)
+      state = restored
+      start_step = int(state.step)
+      logging.info('Restored checkpoint from step %d', start_step)
 
-  # Replicate optimizer.
-  optimizer = jax_utils.replicate(optimizer)
+  # Replicate state
+  state = jax_utils.replicate(state)
 
   learning_rate_fn = train_utils.create_learning_rate_scheduler(
       base_learning_rate=learning_rate)
@@ -219,7 +236,6 @@ def main(argv):
       functools.partial(train_step, learning_rate_fn=learning_rate_fn),
       axis_name='batch')
   p_eval_step = jax.pmap(eval_step, axis_name='batch')
-  # p_pred_step = jax.pmap(predict_step, axis_name='batch')
 
   def run_eval(eval_ds, num_eval_steps=-1):
     eval_metrics = []
@@ -229,19 +245,16 @@ def main(argv):
     else:
       num_iter = range(num_eval_steps)
     for _, eval_batch in zip(num_iter, eval_iter):
-      # pylint: disable=protected-access
-      eval_batch = common_utils.shard(
-          jax.tree_map(lambda x: x._numpy(), eval_batch))
-      # pylint: enable=protected-access
-      metrics = p_eval_step(optimizer.target, eval_batch)
+      eval_batch = {k: v.numpy() for k, v in eval_batch.items()}
+      eval_batch = common_utils.shard(eval_batch)
+      metrics = p_eval_step(state, eval_batch)
       eval_metrics.append(metrics)
     eval_metrics = common_utils.get_metrics(eval_metrics)
-    eval_metrics_sums = jax.tree_map(jnp.sum, eval_metrics)
+    eval_metrics_sums = jax.tree_util.tree_map(jnp.sum, eval_metrics)
     eval_denominator = eval_metrics_sums.pop('denominator')
-    eval_summary = jax.tree_map(
-        lambda x: x / eval_denominator,  # pylint: disable=cell-var-from-loop
+    eval_summary = jax.tree_util.tree_map(
+        lambda x: x / eval_denominator,
         eval_metrics_sums)
-    # Calculate (clipped) perplexity after averaging log-perplexities:
     eval_summary['perplexity'] = jnp.clip(
         jnp.exp(eval_summary['loss']), a_max=1.0e4)
     return eval_summary
@@ -250,15 +263,15 @@ def main(argv):
     with tf.io.gfile.GFile(os.path.join(FLAGS.model_dir, 'results.json'),
                            'w') as f:
       test_summary = run_eval(test_ds)
-      json.dump(jax.tree_map(lambda x: x.tolist(), test_summary), f)
+      json.dump(jax.tree_util.tree_map(lambda x: x.tolist(), test_summary), f)
     return
 
   metrics_all = []
   tick = time.time()
   for step, batch in zip(range(start_step, num_train_steps), train_iter):
-    batch = common_utils.shard(jax.tree_map(lambda x: x._numpy(), batch))  # pylint: disable=protected-access
-    optimizer, metrics, dropout_rngs = p_train_step(
-        optimizer, batch, dropout_rng=dropout_rngs)
+    batch = {k: v.numpy() for k, v in batch.items()}
+    batch = common_utils.shard(batch)
+    state, metrics = p_train_step(state, batch)
     metrics_all.append(metrics)
     logging.info('train in step: %d', step)
 
@@ -266,30 +279,29 @@ def main(argv):
     if ((step % config.checkpoint_freq == 0 and step > 0) or
         step == num_train_steps - 1):
       if jax.process_index() == 0 and config.save_checkpoints:
-        # Save unreplicated optimizer + model state.
-        checkpoints.save_checkpoint(FLAGS.model_dir,
-                                    jax_utils.unreplicate(optimizer), step)
+        unreplicated_state = jax_utils.unreplicate(state)
+        checkpointer = ocp.StandardCheckpointer()
+        ckpt_path = os.path.join(ckpt_dir, f'checkpoint_{step}')
+        checkpointer.save(ckpt_path, unreplicated_state)
 
     # Periodic metric handling.
     if step % eval_freq == 0 and step > 0:
       metrics_all = common_utils.get_metrics(metrics_all)
       lr = metrics_all.pop('learning_rate').mean()
-      metrics_sums = jax.tree_map(jnp.sum, metrics_all)
+      metrics_sums = jax.tree_util.tree_map(jnp.sum, metrics_all)
       denominator = metrics_sums.pop('denominator')
-      summary = jax.tree_map(lambda x: x / denominator, metrics_sums)  # pylint: disable=cell-var-from-loop
+      summary = jax.tree_util.tree_map(lambda x: x / denominator, metrics_sums)
       summary['learning_rate'] = lr
-      # Calculate (clipped) perplexity after averaging log-perplexities:
       summary['perplexity'] = jnp.clip(jnp.exp(summary['loss']), a_max=1.0e4)
       logging.info('train in step: %d, loss: %.4f', step, summary['loss'])
       if jax.process_index() == 0:
         tock = time.time()
         steps_per_sec = eval_freq / (tock - tick)
         tick = tock
-        summary_writer.scalar('steps per second', steps_per_sec, step)
+        summary_writer.add_scalar('steps per second', steps_per_sec, step)
         for key, val in summary.items():
-          summary_writer.scalar(f'train_{key}', val, step)
+          summary_writer.add_scalar(f'train_{key}', float(val), step)
         summary_writer.flush()
-      # Reset metric accumulation for next evaluation cycle.
       metrics_all = []
 
       # Eval Metrics
@@ -298,7 +310,7 @@ def main(argv):
                    eval_summary['loss'], eval_summary['accuracy'])
       if jax.process_index() == 0:
         for key, val in eval_summary.items():
-          summary_writer.scalar(f'eval_{key}', val, step)
+          summary_writer.add_scalar(f'eval_{key}', float(val), step)
         summary_writer.flush()
 
 

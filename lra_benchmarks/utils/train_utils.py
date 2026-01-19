@@ -1,11 +1,12 @@
 # Copyright 2021 Google LLC
+# Updated for modern Flax (Linen) API
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -13,82 +14,67 @@
 # limitations under the License.
 """This contains utility functions for model training and evaluation."""
 
-from flax.deprecated import nn
-from flax.training import common_utils
+import jax
 import jax.numpy as jnp
-from lra_benchmarks.models.bigbird import bigbird
-from lra_benchmarks.models.linear_transformer import linear_transformer
-from lra_benchmarks.models.linformer import linformer
-from lra_benchmarks.models.local import local
-from lra_benchmarks.models.longformer import longformer
-from lra_benchmarks.models.performer import performer
-from lra_benchmarks.models.reformer import reformer
-from lra_benchmarks.models.sinkhorn_transformer import sinkhorn_transformer
-from lra_benchmarks.models.sparse_transformer import sparse_attention
-from lra_benchmarks.models.sparse_transformer import sparse_transformer
-from lra_benchmarks.models.synthesizer import synthesizer
+from flax.training import common_utils
 from lra_benchmarks.models.transformer import transformer
-from lra_benchmarks.models.transformer_tlb import transformer_tlb
 import numpy as onp
 
 
-def get_model(model_type, create_model_fn, model_kwargs, *create_model_args):
+# Model registry - maps model type to module class
+MODEL_REGISTRY = {
+    'transformer': transformer.TransformerEncoder,
+    'transformer_dual': transformer.TransformerDualEncoder,
+    # Add other models as they are updated to Linen API:
+    # 'synthesizer': synthesizer.SynthesizerEncoder,
+    # 'reformer': reformer.ReformerEncoder,
+    # 'performer': performer.PerformerEncoder,
+    # 'linformer': linformer.LinformerEncoder,
+    # 'local': local.LocalTransformerEncoder,
+    # 'bigbird': bigbird.BigBirdEncoder,
+    # 'sinkhorn': sinkhorn_transformer.SinkhornTransformerEncoder,
+    # 'linear_transformer': linear_transformer.LinearTransformerEncoder,
+    # 'sparse_transformer': sparse_transformer.SparseTransformerEncoder,
+    # 'longformer': longformer.LongformerEncoder,
+    # 'transformer_tlb': transformer_tlb.StatefulTransformerEncoder,
+}
+
+
+def get_model_class(model_type):
+  """Get the model class for a given model type.
+
+  Args:
+    model_type: str; Type of Transformer model.
+
+  Returns:
+    Model class.
+  """
+  if model_type not in MODEL_REGISTRY:
+    raise ValueError(f'Model type {model_type} not supported. '
+                     f'Available: {list(MODEL_REGISTRY.keys())}')
+  return MODEL_REGISTRY[model_type]
+
+
+def create_model(model_type, model_kwargs, rng, input_shape):
   """Create and initialize the model.
 
   Args:
     model_type: str; Type of Transformer model to create.
-    create_model_fn: fn: Function that is used for creating the model.
-    model_kwargs: keyword argument to the model.
-    *create_model_args: positional argument to the create_model_args.
+    model_kwargs: dict; keyword arguments to the model.
+    rng: JAX PRNG key.
+    input_shape: tuple; shape of input (batch_size, seq_len).
 
   Returns:
-    Initialized model.
+    Tuple of (model, params).
   """
-  if model_type == 'transformer':
-    return create_model_fn(transformer.TransformerEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'synthesizer':
-    return create_model_fn(synthesizer.SynthesizerEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'reformer':
-    return create_model_fn(reformer.ReformerEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'performer':
-    return create_model_fn(performer.PerformerEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'linformer':
-    return create_model_fn(linformer.LinformerEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'local':
-    return create_model_fn(local.LocalTransformerEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'bigbird':
-    return create_model_fn(bigbird.BigBirdEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'sinkhorn':
-    return create_model_fn(sinkhorn_transformer.SinkhornTransformerEncoder,
-                           model_kwargs, *create_model_args)
-  elif model_type == 'linear_transformer':
-    return create_model_fn(linear_transformer.LinearTransformerEncoder,
-                           model_kwargs, *create_model_args)
-  elif model_type == 'sparse_transformer':
-    model_kwargs['attention_patterns'] = [
-        sparse_attention.Fixed1Pattern(block_size=50),
-        sparse_attention.Fixed2Pattern(block_size=50, c=10)
-    ]
-    return create_model_fn(sparse_transformer.SparseTransformerEncoder,
-                           model_kwargs, *create_model_args)
-  elif model_type == 'longformer':
-    return create_model_fn(longformer.LongformerEncoder, model_kwargs,
-                           *create_model_args)
-  elif model_type == 'transformer_tlb':
-    return create_model_fn(transformer_tlb.StatefulTransformerEncoder,
-                           model_kwargs, *create_model_args)
-  elif model_type == 'transformer_tlb_dual':
-    return create_model_fn(transformer_tlb.StatefulTransformerDualEncoder,
-                           model_kwargs, *create_model_args)
-  else:
-    raise ValueError('Model type not supported')
+  model_class = get_model_class(model_type)
+  model = model_class(**model_kwargs)
+  
+  # Initialize model
+  dummy_input = jnp.ones(input_shape, dtype=jnp.int32)
+  variables = model.init(rng, dummy_input, train=False)
+  
+  return model, variables['params']
 
 
 def create_learning_rate_scheduler(
@@ -162,7 +148,7 @@ def compute_weighted_cross_entropy(logits, targets, num_classes, weights=None):
     Tuple of scalar loss and batch normalizing factor.
   """
   onehot_targets = common_utils.onehot(targets, num_classes)
-  loss = -jnp.sum(onehot_targets * nn.log_softmax(logits), axis=-1)
+  loss = -jnp.sum(onehot_targets * jax.nn.log_softmax(logits), axis=-1)
   normalizing_factor = onehot_targets.sum()
   if weights is not None:
     loss = loss * weights
@@ -192,3 +178,20 @@ def compute_weighted_accuracy(logits, targets, weights=None):
     normalizing_factor = weights.sum()
 
   return loss.sum(), normalizing_factor
+
+
+# Legacy function for backward compatibility
+def get_model(model_type, create_model_fn, model_kwargs, *create_model_args):
+  """Create and initialize the model (legacy interface).
+
+  Args:
+    model_type: str; Type of Transformer model to create.
+    create_model_fn: fn: Function that is used for creating the model.
+    model_kwargs: keyword argument to the model.
+    *create_model_args: positional argument to the create_model_args.
+
+  Returns:
+    Initialized model.
+  """
+  model_class = get_model_class(model_type)
+  return create_model_fn(model_class, model_kwargs, *create_model_args)
